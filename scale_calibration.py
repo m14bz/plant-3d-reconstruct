@@ -6,11 +6,11 @@ import cv2.aruco as aruco
 
 # ==================== 配置参数 ====================
 # 输入PLY点云路径（三维预处理后的输出）
-ply_path = r"C:\Users\26457\Desktop\demo-3d-reconstruction\dataset\0001.ply"
+ply_path = r"C:\Users\26457\Desktop\demo-3d-reconstruction\output\0001\labels\0001.ply"
 
 # ArUco标记的实际边长（单位：米）
 # 拍摄时放置在地面上的标记实物尺寸
-ARUCO_MARKER_SIZE_M = 0.10
+ARUCO_MARKER_SIZE_M = 0.05
 
 # ArUco字典类型（需与实际打印的标记一致）
 ARUCO_DICT_NAME = "DICT_4X4_50"
@@ -20,7 +20,7 @@ TOPVIEW_IMG_PX = 2000
 
 # ==================== 尺度校准 ====================
 """
-步骤5：尺度校准（基于ArUco标记）
+步骤5：尺度校准（基于）
 
 功能说明：
     从PLY点云中自动计算真实物理尺度，消除三维重建的任意尺度问题。
@@ -77,20 +77,64 @@ img[yi, xi] = cols[:, :3]  # RGB
 
 print("俯视图投影完成，开始检测ArUco标记...")
 
-# 检测ArUco标记
-gray     = cv2.cvtColor(cv2.GaussianBlur(img, (5, 5), 0), cv2.COLOR_RGB2GRAY)
+# 保存俯视图（无论是否检测成功，供人工检查）
+debug_topview = ply_path.replace(".ply", "_topview_debug.png")
+cv2.imwrite(debug_topview, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+print(f"俯视图已保存（请打开确认ArUco是否可见）: {debug_topview}")
+
+# 颜色统计
+print(f"颜色统计: min={cols.min()} max={cols.max()} mean={cols.mean():.1f}")
+
 adict    = aruco.getPredefinedDictionary(getattr(aruco, ARUCO_DICT_NAME))
-detector = aruco.ArucoDetector(adict, aruco.DetectorParameters())
-corners, ids, _ = detector.detectMarkers(gray)
+params   = aruco.DetectorParameters()
+# 放宽检测参数，提高对低分辨率点云投影的鲁棒性
+params.adaptiveThreshWinSizeMin  = 3
+params.adaptiveThreshWinSizeMax  = 53
+params.adaptiveThreshWinSizeStep = 2
+params.minMarkerPerimeterRate    = 0.01
+params.maxMarkerPerimeterRate    = 4.0
+params.polygonalApproxAccuracyRate = 0.05
+detector = aruco.ArucoDetector(adict, params)
+
+# 尝试三个投影轴（X-Y / X-Z / Y-Z），找到能检测到ArUco的那个
+def try_detect(axis0, axis1, label):
+    """将点云投影到 axis0-axis1 平面，尝试检测ArUco"""
+    a0_min, a1_min = pts[:, axis0].min(), pts[:, axis1].min()
+    span_ = max(pts[:, axis0].max() - a0_min, pts[:, axis1].max() - a1_min)
+    if span_ == 0:
+        return None, None, None
+    ppu_ = TOPVIEW_IMG_PX / span_
+    im = np.full((TOPVIEW_IMG_PX, TOPVIEW_IMG_PX, 3), 255, dtype=np.uint8)
+    xi_ = np.clip(((pts[:, axis0] - a0_min) * ppu_).astype(int), 0, TOPVIEW_IMG_PX - 1)
+    yi_ = np.clip(((pts[:, axis1] - a1_min) * ppu_).astype(int), 0, TOPVIEW_IMG_PX - 1)
+    im[yi_, xi_] = cols[:, :3]
+    gray_ = cv2.cvtColor(cv2.GaussianBlur(im, (5, 5), 0), cv2.COLOR_RGB2GRAY)
+    # 保存各轴投影图
+    cv2.imwrite(ply_path.replace(".ply", f"_topview_{label}.png"),
+                cv2.cvtColor(im, cv2.COLOR_RGB2BGR))
+    c_, i_, _ = detector.detectMarkers(gray_)
+    return c_, i_, ppu_
+
+corners, ids, ppu = None, None, None
+for (ax0, ax1, label) in [(0, 1, "XY"), (0, 2, "XZ"), (1, 2, "YZ")]:
+    c, i, p = try_detect(ax0, ax1, label)
+    if i is not None and len(i) > 0:
+        print(f"  在 {label} 投影中检测到标记！")
+        corners, ids, ppu = c, i, p
+        break
+    else:
+        print(f"  {label} 投影: 未检测到")
 
 if ids is None or len(ids) == 0:
     raise RuntimeError(
-        "未检测到ArUco标记！\n"
-        "排查步骤：\n"
-        "  1. 点云是否有颜色（cols.max > 0）\n"
-        "  2. ArUco标记是否正面朝上\n"
-        "  3. ARUCO_DICT_NAME 是否与打印的字典一致\n"
-        "  4. 尝试增大 TOPVIEW_IMG_PX = 4000"
+        "三个投影面（XY / XZ / YZ）均未检测到ArUco标记。\n"
+        "请打开保存的 _topview_XY.png / _topview_XZ.png / _topview_YZ.png，\n"
+        "确认ArUco标记是否清晰可见（黑白方格图案）。\n"
+        "常见原因：\n"
+        "  1. 重建时未启用顶点颜色（-calculateVertexColors）\n"
+        "  2. 点云采样太稀疏（dataset 中采样数 number_of_points 太小）\n"
+        "  3. ArUco字典不对（修改 ARUCO_DICT_NAME）\n"
+        "  4. 增大分辨率：TOPVIEW_IMG_PX = 4000"
     )
 
 print(f"检测到 {len(ids)} 个标记，ID = {ids.flatten()}")
